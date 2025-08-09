@@ -1,0 +1,171 @@
+- name: Set hostnames
+  hosts: all
+  become: true 
+  tasks:
+    - name: Set the hostname for {{ inventory_hostname }} to {{ hostname }}
+      ansible.builtin.hostname:
+        name: "{{ hostname }}"
+    - name: print hostname
+      debug:
+        msg: "Hostname is {{ ansible_hostname }}"
+
+- hosts: kubernetes
+  become: yes
+  tasks:
+    - name: update apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+
+    - name: Disable swap
+      command: swapoff -a
+
+    - name: Comment out swap in fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].* swap .*)$'
+        replace: '# \1'
+
+    - name: Load required modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+    - name: update apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+
+    - name: Set sysctl params
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+
+    - name: Apply sysctl
+      command: sysctl --system
+
+    - name: update apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add containerd repo
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    - name: update apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Generate containerd config
+      shell: |
+        containerd config default | tee /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        systemctl restart containerd
+        systemctl enable containerd
+    - name: update apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+
+    - name: Add Kubernetes repo
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /" \
+        | tee /etc/apt/sources.list.d/kubernetes.list
+    - name: update apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+
+    - name: Install kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Ensure kubelet, kubeadm, and kubectl are on hold (to prevent upgrades)
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+    - name: update apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+  
+- hosts: masters
+  become: yes
+  tasks:
+    - name: Initialize kubeadm
+      command: kubeadm init
+      register: kubeadm_init
+      changed_when: "'initialized' in kubeadm_init.stdout"
+
+    - name: Create .kube directory
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Copy admin.conf to kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
+
+    - name: Install calico 
+      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.30.1/manifests/calico.yaml
+      environment:
+        KUBECONFIG: .kube/config
+
+    - name: Get join command
+      shell: kubeadm token create --print-join-command
+      register: join_cmd
+
+    - name: Set join command
+      set_fact:
+        kube_join_cmd: "{{ join_cmd.stdout }}"
+
+- hosts: workers
+  become: yes
+  tasks:
+    - name: Join node to cluster
+      command: "{{ hostvars[groups['masters'][0]].kube_join_cmd }}"

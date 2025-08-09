@@ -1,0 +1,26 @@
+- name: Reset Kubernetes on all nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Run kubeadm reset
+      command: kubeadm reset -f
+
+- name: Uninstall Kubernetes tools
+  hosts: all
+  become: yes
+  tasks:
+    - name: Unhold kubelet, kubeadm, kubectl
+      ansible.builtin.command: apt-mark unhold kubelet kubeadm kubectl
+
+    - name: Remove kubelet, kubeadm, kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: absent
+        allow_change_held_packages: yes
+    - name: Remove kubectl binary if manually installed
+      file:
+        path: /usr/local/bin/kubectl
+        state: absent
